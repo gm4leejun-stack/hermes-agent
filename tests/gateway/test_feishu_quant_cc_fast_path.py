@@ -176,3 +176,83 @@ async def test_feishu_quant_cc_analysis_does_not_send_second_error_after_result_
     poll_task.assert_awaited_once_with(170)
     wait_event.assert_awaited_once_with(170)
     ack_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_feishu_quant_cc_analysis_sends_followup_result_after_submit_message_when_task_not_terminal(monkeypatch):
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    submit = AsyncMock(return_value={'task_id': 177})
+    poll_task = AsyncMock(return_value=None)
+    wait_event = AsyncMock(
+        return_value={
+            'id': 27,
+            'payload': {
+                'task_id': 177,
+                'status': 'succeeded',
+                'result_json': '{"message": "AMZN 建议已推送", "rec_id": 847}',
+            },
+        }
+    )
+    ack_event = AsyncMock(return_value=True)
+    monkeypatch.setattr(gateway_run, '_submit_quant_cc_analysis', submit, raising=False)
+    monkeypatch.setattr(gateway_run, '_poll_quant_cc_task_until_terminal', poll_task, raising=False)
+    monkeypatch.setattr(gateway_run, '_wait_quant_cc_engine_event', wait_event, raising=False)
+    monkeypatch.setattr(gateway_run, '_ack_quant_cc_engine_event', ack_event, raising=False)
+
+    result = await runner._handle_message(_make_event('amzn持仓分析'))
+
+    assert result is None
+    assert runner.adapters[Platform.FEISHU].send.await_args_list == [
+        (( 'oc_home', 'AMZN 分析任务已提交（task_id=177），结果仍在生成中，请稍后查看。'),),
+        (( 'oc_home', 'AMZN 建议已推送'),),
+    ]
+    submit.assert_awaited_once()
+    poll_task.assert_awaited_once_with(177)
+    wait_event.assert_awaited_once_with(177)
+    ack_event.assert_awaited_once_with(27)
+
+
+@pytest.mark.asyncio
+async def test_feishu_quant_cc_analysis_refetches_task_result_when_engine_event_lacks_payload(monkeypatch):
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    submit = AsyncMock(return_value={'task_id': 178})
+    poll_task = AsyncMock(return_value=None)
+    fetch_task = AsyncMock(
+        return_value={
+            'id': 178,
+            'status': 'succeeded',
+            'result': {'message': 'AMZN 最终分析已推送', 'rec_id': 848},
+        }
+    )
+    wait_event = AsyncMock(
+        return_value={
+            'id': 28,
+            'payload': {
+                'task_id': 178,
+                'status': 'succeeded',
+            },
+        }
+    )
+    ack_event = AsyncMock(return_value=True)
+    monkeypatch.setattr(gateway_run, '_submit_quant_cc_analysis', submit, raising=False)
+    monkeypatch.setattr(gateway_run, '_poll_quant_cc_task_until_terminal', poll_task, raising=False)
+    monkeypatch.setattr(gateway_run, '_get_quant_cc_task', fetch_task, raising=False)
+    monkeypatch.setattr(gateway_run, '_wait_quant_cc_engine_event', wait_event, raising=False)
+    monkeypatch.setattr(gateway_run, '_ack_quant_cc_engine_event', ack_event, raising=False)
+
+    result = await runner._handle_message(_make_event('amzn持仓分析'))
+
+    assert result is None
+    assert runner.adapters[Platform.FEISHU].send.await_args_list == [
+        (('oc_home', 'AMZN 分析任务已提交（task_id=178），结果仍在生成中，请稍后查看。'),),
+        (('oc_home', 'AMZN 最终分析已推送'),),
+    ]
+    submit.assert_awaited_once()
+    poll_task.assert_awaited_once_with(178)
+    fetch_task.assert_awaited_once_with(178)
+    wait_event.assert_awaited_once_with(178)
+    ack_event.assert_awaited_once_with(28)

@@ -617,14 +617,19 @@ async def _submit_quant_cc_analysis(*, symbol: str, asset_class: str, force_refr
     )
 
 
+async def _get_quant_cc_task(task_id: int) -> Optional[Dict[str, Any]]:
+    body = await asyncio.to_thread(
+        _quant_cc_fetch_json_sync,
+        f"/api/run_analysis_tasks/{int(task_id)}",
+    )
+    task = body.get("task")
+    return task if isinstance(task, dict) else None
+
+
 async def _poll_quant_cc_task_until_terminal(task_id: int, *, attempts: int = 30, interval_seconds: float = 2.0) -> Optional[Dict[str, Any]]:
     for attempt in range(max(1, attempts)):
         await asyncio.sleep(interval_seconds if attempt > 0 else 2.0)
-        body = await asyncio.to_thread(
-            _quant_cc_fetch_json_sync,
-            f"/api/run_analysis_tasks/{int(task_id)}",
-        )
-        task = body.get("task") or {}
+        task = await _get_quant_cc_task(task_id) or {}
         status = str(task.get("status") or "")
         if status in {"succeeded", "failed"}:
             return task
@@ -667,6 +672,40 @@ def _quant_cc_result_message(symbol: str, task_id: int, task: Optional[Dict[str,
     result = task.get("result") or {}
     message = str(result.get("message") or f"{symbol} 分析完成").strip()
     return message or f"{symbol} 分析完成"
+
+
+def _quant_cc_event_message(symbol: str, task_id: int, event: Optional[Dict[str, Any]]) -> Optional[str]:
+    event = event or {}
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    status = str(payload.get("status") or "")
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    if not result and payload.get("result_json"):
+        try:
+            parsed = json.loads(str(payload.get("result_json") or ""))
+            if isinstance(parsed, dict):
+                result = parsed
+        except Exception:
+            result = {}
+    if status == "failed":
+        error_text = str((result or {}).get("error") or payload.get("error") or "unknown").strip() or "unknown"
+        return f"{symbol} 分析失败（task_id={task_id}）：{error_text}"
+    if status == "succeeded":
+        message = str((result or {}).get("message") or f"{symbol} 分析完成").strip()
+        return message or f"{symbol} 分析完成"
+    return None
+
+
+def _quant_cc_event_has_display_payload(event: Optional[Dict[str, Any]]) -> bool:
+    event = event or {}
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    status = str(payload.get("status") or "")
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    result_json = payload.get("result_json")
+    if status == "failed":
+        return bool((result or {}).get("error") or payload.get("error") or result_json)
+    if status == "succeeded":
+        return bool((result or {}).get("message") or result_json)
+    return False
 
 
 class GatewayRunner:
@@ -2023,6 +2062,13 @@ class GatewayRunner:
         try:
             delivery_event = await _wait_quant_cc_engine_event(task_id)
             if delivery_event and delivery_event.get("id"):
+                followup_message = _quant_cc_event_message(symbol, task_id, delivery_event)
+                if task is None and not _quant_cc_event_has_display_payload(delivery_event):
+                    latest_task = await _get_quant_cc_task(task_id)
+                    if latest_task and str(latest_task.get("status") or "") in {"succeeded", "failed"}:
+                        followup_message = _quant_cc_result_message(symbol, task_id, latest_task)
+                if task is None and followup_message:
+                    await adapter.send(source.chat_id, followup_message)
                 await _ack_quant_cc_engine_event(int(delivery_event["id"]))
         except Exception as exc:
             logger.warning("Feishu Quant-CC engine event follow-up failed: %s", exc)
