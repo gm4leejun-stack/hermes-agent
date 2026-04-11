@@ -107,3 +107,9 @@ async def test_feishu_quant_cc_analysis_failure_returns_programmatic_error_not_f
     poll_task.assert_awaited_once_with(163)
     wait_event.assert_awaited_once_with(163)
     ack_event.assert_awaited_once_with(18)
+
+
+def test_gateway_run_module_still_exports_delivery_router():
+    import gateway.run as gateway_run
+
+    assert gateway_run.DeliveryRouter is not None

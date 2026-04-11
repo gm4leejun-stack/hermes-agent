@@ -233,6 +233,7 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
 )
+from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 def _load_workflow_state() -> Optional[Dict[str, Any]]:
     try:
