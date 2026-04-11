@@ -564,7 +564,7 @@ def _quant_cc_engine_id() -> str:
 
 
 def _quant_cc_extract_symbol(text: str) -> Optional[str]:
-    matches = re.findall(r"\b[A-Z]{2,5}\b", str(text or "").upper())
+    matches = re.findall(r"(?<![A-Z0-9])[A-Z]{2,5}(?![A-Z0-9])", str(text or "").upper())
     return matches[-1] if matches else None
 
 
@@ -2015,15 +2015,18 @@ class GatewayRunner:
                 else _quant_cc_result_message(symbol, task_id, task)
             )
             await adapter.send(source.chat_id, message)
-
-            delivery_event = await _wait_quant_cc_engine_event(task_id)
-            if delivery_event and delivery_event.get("id"):
-                await _ack_quant_cc_engine_event(int(delivery_event["id"]))
-            return True
         except Exception as exc:
             logger.warning("Feishu Quant-CC fast path failed: %s", exc)
             await adapter.send(source.chat_id, f"{symbol} 分析任务提交失败：{exc}")
             return True
+
+        try:
+            delivery_event = await _wait_quant_cc_engine_event(task_id)
+            if delivery_event and delivery_event.get("id"):
+                await _ack_quant_cc_engine_event(int(delivery_event["id"]))
+        except Exception as exc:
+            logger.warning("Feishu Quant-CC engine event follow-up failed: %s", exc)
+        return True
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
