@@ -626,6 +626,19 @@ async def _get_quant_cc_task(task_id: int) -> Optional[Dict[str, Any]]:
     return task if isinstance(task, dict) else None
 
 
+async def _get_quant_cc_recommendation_detail(rec_id: int) -> Optional[str]:
+    body = await asyncio.to_thread(
+        _quant_cc_fetch_json_sync,
+        "/api/handle_callback",
+        "POST",
+        {"data": f"rec_detail:{int(rec_id)}"},
+    )
+    reply_text = str(body.get("reply_text") or "").strip()
+    if reply_text.startswith("建议 #") and "不存在" in reply_text:
+        return None
+    return reply_text or None
+
+
 async def _poll_quant_cc_task_until_terminal(task_id: int, *, attempts: int = 30, interval_seconds: float = 2.0) -> Optional[Dict[str, Any]]:
     for attempt in range(max(1, attempts)):
         await asyncio.sleep(interval_seconds if attempt > 0 else 2.0)
@@ -695,6 +708,64 @@ def _quant_cc_event_message(symbol: str, task_id: int, event: Optional[Dict[str,
     return None
 
 
+def _quant_cc_extract_detail_ids(result: Optional[Dict[str, Any]]) -> list[int]:
+    result = result if isinstance(result, dict) else {}
+    detail_ids: list[int] = []
+    for raw in (result.get("layer1_id"), result.get("rec_id"), result.get("layer2_id")):
+        try:
+            value = int(raw)
+        except Exception:
+            continue
+        if value > 0 and value not in detail_ids:
+            detail_ids.append(value)
+    return detail_ids
+
+
+def _quant_cc_extract_result_from_event(event: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    event = event or {}
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    if not result and payload.get("result_json"):
+        try:
+            parsed = json.loads(str(payload.get("result_json") or ""))
+            if isinstance(parsed, dict):
+                result = parsed
+        except Exception:
+            result = {}
+    return result if isinstance(result, dict) else {}
+
+
+async def _quant_cc_detail_or_message_for_task(symbol: str, task_id: int, task: Optional[Dict[str, Any]]) -> str:
+    task = task or {}
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    detail_texts: list[str] = []
+    for rec_id in _quant_cc_extract_detail_ids(result):
+        try:
+            detail_text = await _get_quant_cc_recommendation_detail(rec_id)
+        except Exception:
+            detail_text = None
+        if detail_text and detail_text not in detail_texts:
+            detail_texts.append(detail_text)
+    if detail_texts:
+        return "\n\n".join(detail_texts)
+    return _quant_cc_result_message(symbol, task_id, task)
+
+
+async def _quant_cc_detail_or_message_for_event(symbol: str, task_id: int, event: Optional[Dict[str, Any]]) -> Optional[str]:
+    result = _quant_cc_extract_result_from_event(event)
+    detail_texts: list[str] = []
+    for rec_id in _quant_cc_extract_detail_ids(result):
+        try:
+            detail_text = await _get_quant_cc_recommendation_detail(rec_id)
+        except Exception:
+            detail_text = None
+        if detail_text and detail_text not in detail_texts:
+            detail_texts.append(detail_text)
+    if detail_texts:
+        return "\n\n".join(detail_texts)
+    return _quant_cc_event_message(symbol, task_id, event)
+
+
 def _quant_cc_event_has_display_payload(event: Optional[Dict[str, Any]]) -> bool:
     event = event or {}
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -706,6 +777,14 @@ def _quant_cc_event_has_display_payload(event: Optional[Dict[str, Any]]) -> bool
     if status == "succeeded":
         return bool((result or {}).get("message") or result_json)
     return False
+
+
+async def _send_quant_cc_fast_path_message(adapter: Any, chat_id: str, message: str) -> None:
+    send_result = await adapter.send(chat_id, message)
+    if getattr(send_result, "success", True):
+        return
+    error_text = str(getattr(send_result, "error", "") or "unknown").strip() or "unknown"
+    raise RuntimeError(f"feishu_send_failed:{error_text}")
 
 
 class GatewayRunner:
@@ -2051,24 +2130,24 @@ class GatewayRunner:
             message = (
                 f"{symbol} 分析任务已提交（task_id={task_id}），结果仍在生成中，请稍后查看。"
                 if task is None
-                else _quant_cc_result_message(symbol, task_id, task)
+                else await _quant_cc_detail_or_message_for_task(symbol, task_id, task)
             )
-            await adapter.send(source.chat_id, message)
+            await _send_quant_cc_fast_path_message(adapter, source.chat_id, message)
         except Exception as exc:
             logger.warning("Feishu Quant-CC fast path failed: %s", exc)
-            await adapter.send(source.chat_id, f"{symbol} 分析任务提交失败：{exc}")
+            await _send_quant_cc_fast_path_message(adapter, source.chat_id, f"{symbol} 分析任务提交失败：{exc}")
             return True
 
         try:
             delivery_event = await _wait_quant_cc_engine_event(task_id)
             if delivery_event and delivery_event.get("id"):
-                followup_message = _quant_cc_event_message(symbol, task_id, delivery_event)
+                followup_message = await _quant_cc_detail_or_message_for_event(symbol, task_id, delivery_event)
                 if task is None and not _quant_cc_event_has_display_payload(delivery_event):
                     latest_task = await _get_quant_cc_task(task_id)
                     if latest_task and str(latest_task.get("status") or "") in {"succeeded", "failed"}:
-                        followup_message = _quant_cc_result_message(symbol, task_id, latest_task)
+                        followup_message = await _quant_cc_detail_or_message_for_task(symbol, task_id, latest_task)
                 if task is None and followup_message:
-                    await adapter.send(source.chat_id, followup_message)
+                    await _send_quant_cc_fast_path_message(adapter, source.chat_id, followup_message)
                 await _ack_quant_cc_engine_event(int(delivery_event["id"]))
         except Exception as exc:
             logger.warning("Feishu Quant-CC engine event follow-up failed: %s", exc)
