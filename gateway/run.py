@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
+from urllib import error as urllib_error, parse as urllib_parse, request as urllib_request
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -232,8 +233,84 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
 )
-from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+def _load_workflow_state() -> Optional[Dict[str, Any]]:
+    try:
+        from .project_management_workflow import load_state
+        state = load_state()
+    except Exception:
+        return None
+
+    if not isinstance(state, dict):
+        return None
+    return state
+
+
+def _get_next_workflow_task(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    candidates: List[Dict[str, Any]] = []
+
+    for project in state.get("projects", []):
+        if not isinstance(project, dict):
+            continue
+        if project.get("state") not in {"planned", "active", "blocked"}:
+            continue
+        for milestone in project.get("milestones", []):
+            if not isinstance(milestone, dict):
+                continue
+            if milestone.get("state") in {"done", "completed", "canceled"}:
+                continue
+            for task in milestone.get("tasks", []):
+                if not isinstance(task, dict):
+                    continue
+                if task.get("state") not in {"todo", "doing", "blocked", "review"}:
+                    continue
+                candidate = dict(task)
+                candidate["project_id"] = project.get("id")
+                candidate["project_name"] = project.get("name")
+                candidate["milestone_id"] = milestone.get("id")
+                candidate["milestone_name"] = milestone.get("name")
+                candidates.append(candidate)
+
+    if not candidates:
+        return None
+
+    def sort_key(task: Dict[str, Any]) -> tuple:
+        return (
+            priority_order.get(str(task.get("priority", "medium")).lower(), 1),
+            str(task.get("updated_at") or task.get("created_at") or ""),
+            str(task.get("id") or ""),
+        )
+
+    candidates.sort(key=sort_key)
+    return candidates[0]
+
+
+def _build_workflow_notice(state: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Build a short continuity notice for the active project-management workflow state."""
+    if not isinstance(state, dict):
+        return None
+    try:
+        from .project_management_workflow import get_next_task, get_current_priority
+
+        next_task = get_next_task(state)
+        if next_task:
+            parts = ["Project workflow continuity:"]
+            parts.append(f"- Next task: {next_task.get('title') or next_task.get('id') or 'unknown task'}")
+            parts.append(f"- Project: {next_task.get('project_name') or next_task.get('project_id') or 'unknown project'}")
+            parts.append(f"- Milestone: {next_task.get('milestone_name') or next_task.get('milestone_id') or 'unknown milestone'}")
+            if next_task.get("priority"):
+                parts.append(f"- Priority: {next_task.get('priority')}")
+            if next_task.get("state"):
+                parts.append(f"- State: {next_task.get('state')}")
+            return "\n".join(parts)
+
+        current_priority = get_current_priority(state)
+        if current_priority:
+            return f"Project workflow continuity: current priority is {current_priority}."
+    except Exception:
+        return None
+    return None
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -458,6 +535,139 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
+_QUANT_CC_A_CLASS_SYMBOLS = {
+    "SPY",
+    "VOO",
+    "IVV",
+    "QQQ",
+    "QQQM",
+    "GLD",
+    "IAU",
+    "GDX",
+    "IBIT",
+    "TLT",
+}
+
+
+def _quant_cc_base_url() -> str:
+    raw = (
+        os.getenv("QUANT_CC_BASE_URL")
+        or os.getenv("QUANT_CC_API")
+        or "http://localhost:8001"
+    )
+    return raw.strip().rstrip("/") or "http://localhost:8001"
+
+
+def _quant_cc_engine_id() -> str:
+    return (os.getenv("QUANT_CC_ENGINE_ID") or "hermes-feishu-main").strip() or "hermes-feishu-main"
+
+
+def _quant_cc_extract_symbol(text: str) -> Optional[str]:
+    matches = re.findall(r"\b[A-Z]{2,5}\b", str(text or "").upper())
+    return matches[-1] if matches else None
+
+
+def _quant_cc_is_analysis_intent(text: str) -> bool:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return False
+    if "进度" in cleaned or "状态" in cleaned:
+        return False
+    return bool(re.search(r"(分析|看一下|看下|怎么看|怎么样|持仓|看\s*[A-Za-z]{2,5})", cleaned))
+
+
+def _quant_cc_force_refresh_intent(text: str) -> bool:
+    return bool(re.search(r"(强制刷新|重新拉数据|force\s*refresh)", str(text or ""), re.IGNORECASE))
+
+
+def _quant_cc_asset_class(symbol: str) -> str:
+    return "A" if str(symbol or "").upper() in _QUANT_CC_A_CLASS_SYMBOLS else "B"
+
+
+def _quant_cc_fetch_json_sync(path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    url = f"{_quant_cc_base_url()}{path}"
+    headers = {"X-Engine-Id": _quant_cc_engine_id()}
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps({**payload, "engine_id": _quant_cc_engine_id()}, ensure_ascii=False).encode("utf-8")
+    req = urllib_request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib_request.urlopen(req, timeout=12) as response:
+            raw = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"quant_cc_http_{exc.code}:{body[:200]}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"quant_cc_request_failed:{exc}") from exc
+    return json.loads(raw) if raw else {}
+
+
+async def _submit_quant_cc_analysis(*, symbol: str, asset_class: str, force_refresh: bool) -> Dict[str, Any]:
+    return await asyncio.to_thread(
+        _quant_cc_fetch_json_sync,
+        "/api/run_analysis_async",
+        "POST",
+        {
+            "symbol": symbol,
+            "asset_class": asset_class,
+            "force_refresh": force_refresh,
+        },
+    )
+
+
+async def _poll_quant_cc_task_until_terminal(task_id: int, *, attempts: int = 30, interval_seconds: float = 2.0) -> Optional[Dict[str, Any]]:
+    for attempt in range(max(1, attempts)):
+        await asyncio.sleep(interval_seconds if attempt > 0 else 2.0)
+        body = await asyncio.to_thread(
+            _quant_cc_fetch_json_sync,
+            f"/api/run_analysis_tasks/{int(task_id)}",
+        )
+        task = body.get("task") or {}
+        status = str(task.get("status") or "")
+        if status in {"succeeded", "failed"}:
+            return task
+    return None
+
+
+async def _wait_quant_cc_engine_event(task_id: int, *, after_id: int = 0, attempts: int = 5, interval_seconds: float = 2.0, limit: int = 100) -> Optional[Dict[str, Any]]:
+    cursor = max(0, int(after_id))
+    for attempt in range(max(1, attempts)):
+        if attempt > 0:
+            await asyncio.sleep(interval_seconds)
+        query = urllib_parse.urlencode({"after_id": cursor, "limit": max(1, int(limit))})
+        body = await asyncio.to_thread(
+            _quant_cc_fetch_json_sync,
+            f"/api/engine_events?{query}",
+        )
+        events = body.get("events") or []
+        for event in events:
+            payload = event.get("payload") or {}
+            if int(payload.get("task_id") or 0) == int(task_id):
+                return event
+        cursor = max(cursor, int(body.get("next_after_id") or cursor))
+    return None
+
+
+async def _ack_quant_cc_engine_event(event_id: int) -> bool:
+    body = await asyncio.to_thread(
+        _quant_cc_fetch_json_sync,
+        f"/api/engine_events/{int(event_id)}/ack",
+        "POST",
+    )
+    return bool(body.get("ok"))
+
+
+def _quant_cc_result_message(symbol: str, task_id: int, task: Optional[Dict[str, Any]]) -> str:
+    task = task or {}
+    status = str(task.get("status") or "")
+    if status == "failed":
+        return f"{symbol} 分析失败（task_id={task_id}）：{task.get('error') or 'unknown'}"
+    result = task.get("result") or {}
+    message = str(result.get("message") or f"{symbol} 分析完成").strip()
+    return message or f"{symbol} 分析完成"
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -553,7 +763,13 @@ class GatewayRunner:
             self._session_db = SessionDB()
         except Exception as e:
             logger.debug("SQLite session store not available: %s", e)
-        
+
+        self._workflow_state = _load_workflow_state()
+        self._workflow_next_task = _get_next_workflow_task(self._workflow_state) if self._workflow_state else None
+        workflow_notice = _build_workflow_notice(self._workflow_state)
+        if workflow_notice:
+            logger.info(workflow_notice)
+
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
@@ -1764,6 +1980,50 @@ class GatewayRunner:
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
     
+    async def _maybe_handle_quant_cc_fast_path(self, event: MessageEvent) -> bool:
+        source = event.source
+        if not source or source.platform != Platform.FEISHU:
+            return False
+
+        text = str(event.text or "").strip()
+        if not _quant_cc_is_analysis_intent(text):
+            return False
+
+        symbol = _quant_cc_extract_symbol(text)
+        if not symbol:
+            return False
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return False
+
+        try:
+            submit = await _submit_quant_cc_analysis(
+                symbol=symbol,
+                asset_class=_quant_cc_asset_class(symbol),
+                force_refresh=_quant_cc_force_refresh_intent(text),
+            )
+            task_id = int(submit.get("task_id") or 0)
+            if task_id <= 0:
+                raise RuntimeError("missing_task_id")
+
+            task = await _poll_quant_cc_task_until_terminal(task_id)
+            message = (
+                f"{symbol} 分析任务已提交（task_id={task_id}），结果仍在生成中，请稍后查看。"
+                if task is None
+                else _quant_cc_result_message(symbol, task_id, task)
+            )
+            await adapter.send(source.chat_id, message)
+
+            delivery_event = await _wait_quant_cc_engine_event(task_id)
+            if delivery_event and delivery_event.get("id"):
+                await _ack_quant_cc_engine_event(int(delivery_event["id"]))
+            return True
+        except Exception as exc:
+            logger.warning("Feishu Quant-CC fast path failed: %s", exc)
+            await adapter.send(source.chat_id, f"{symbol} 分析任务提交失败：{exc}")
+            return True
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -1843,6 +2103,9 @@ class GatewayRunner:
                 _update_prompts.pop(_quick_key, None)
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
                 return f"✓ Sent `{label}` to the update process."
+
+        if not event.is_command() and await self._maybe_handle_quant_cc_fast_path(event):
+            return None
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
