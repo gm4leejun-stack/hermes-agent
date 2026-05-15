@@ -388,7 +388,11 @@ registry.register(
     toolset="dashboard", emoji="🔬",
     schema={"name": "dashboard_analysis_run",
             "description": (
-                "【首选】查询指定标的在指定日期的机会分析结果。访问 localhost:8088 必须使用 dashboard_* 工具。"
+                "【仅用于查询调度任务的历史决策记录】读取 DB 中存储的分析快照，不重跑 pipeline。"
+                "适用场景：查看调度系统在某日实际做了什么决策（审计用途）。"
+                "⚠️ 禁止用于获取最新分析结果——DB 中的快照可能来自旧版本 pipeline，"
+                "缺少 ssc_status/sic_status/primary_narrative 等 V3 字段。"
+                "如需分析某标的，必须改用 dashboard_run_analysis（重跑 pipeline）。"
                 "结果在 run.state_json。"
                 "【computed_indicators 字段规则】展示'入场窗口天数'必须用 days_in_entry_window，"
                 "禁止用 days_since_shock_end（仅遗留字段）。"
@@ -421,7 +425,51 @@ registry.register(
     name="dashboard_run_analysis",
     toolset="dashboard", emoji="🚀",
     schema={"name": "dashboard_run_analysis",
-            "description": "【触发】JuhuFaxian 机会分析，支持四方向（CSP_OPEN/CC_OPEN/CC_CLOSE/CSP_CLOSE）。开仓返回交易参数，平仓返回平仓信号。",
+            "description": (
+                "【首选】用最新 pipeline 实时分析指定标的，结果自动存库。"
+                "需要分析某标的时必须用此工具，不要用 dashboard_analysis_run。"
+                "支持四方向（CSP_OPEN/CC_OPEN/CC_CLOSE/CSP_CLOSE）。"
+                "开仓返回交易参数，平仓返回平仓信号。\n\n"
+                "【结果解读规则 — 严格遵守以下术语，禁止自创字段名翻译】\n"
+                "Pipeline 三层：① 机会发现（Opportunity Engine）→ ② 市场引擎（Market Engine，仅 opportunity=YES 时运行）→ ③ 执行引擎（Execution Engine，仅市场可交易时运行）\n\n"
+                "━━ 层 ① 机会发现（从 state_json.computed_indicators 读取以下字段） ━━\n"
+                "⚠️ 以下标签必须与字段完全对应，禁止自创标签或混用：\n"
+                "• state_json.computed_indicators.macro_shock_id → 必须展示，标签：「Shock 起始日（peak）」\n"
+                "• state_json.computed_indicators.shock_trigger_date → 必须展示，标签：「Shock 形成日」\n"
+                "• state_json.computed_indicators.shock_stabilize_date → 必须展示，标签：「企稳日期」\n"
+                "• state_json.computed_indicators.days_in_entry_window → >0 标签：「入场窗口第 N 天」；0 = 窗口未开启；⚠️ 禁止用 days_since_shock_end\n"
+                "• state_json.computed_indicators.trough_to_stable_days → 标签：「谷底→企稳 N 天」\n"
+                "• in_entry_window = True/False → Gate 硬条件（必须为 True 才能继续评分）\n"
+                "• opportunity_signal → YES / CAUTIOUS / NO\n"
+                "  阈值：≥0.70→YES | ≥0.50→CAUTIOUS | <0.50→NO（禁止写 60% 等其他数字）\n"
+                "• opportunity_confidence → 置信度（公式：quality × maturity_weight）\n"
+                "• shock_quality → 冲击质量（0.7×冲击深度 + 0.3×RSI超卖）\n"
+                "  RSI 超卖得分：shock_rsi_min_5d ≤ 50 才有分（公式=(50-rsi)/20）；>50 则得分=0\n"
+                "• panic_exhaustion → 恐慌耗尽（0.60×未继续跌 + 0.25×破低失败 + 0.15×低点上移）\n"
+                "  ⚠️ 分项标注必须读 state_json.opportunity_scores.scores 下的具体字段，禁止根据总分推断：\n"
+                "    no_follow_through_down=True → 未继续跌 ✓；=False → ✗\n"
+                "    low_break_attempt=True → 破低失败 ✓；=False → 破低失败 ✗\n"
+                "    low_shift_up=True → 低点上移 ✓；=False → ✗\n"
+                "  禁止展示支撑位或价格目标等未在 state_json 中明确存在的数值\n"
+                "• quality = shock_quality×0.5 + panic_exhaustion×0.5\n"
+                "• maturity_weight → 成熟度权重（maturity_day = t2s + diw）\n"
+                "• maturity_bucket 映射：mat_3_4_golden=黄金窗口、mat_2_fast_rebound=偏早、mat_1_early=过早、mat_5_late=偏晚、mat_6_plus_slow_recovery=缓慢恢复\n\n"
+                "━━ 层 ② 市场引擎（仅当 opportunity_signal=YES 时才运行） ━━\n"
+                "⚠️ 如果 opportunity_signal=NO 或 CAUTIOUS（且不开仓），market engine 完全不运行，"
+                "market_tradeable/ssc_status/sic_status/structure_break/pre_shock_regime 全为 None。"
+                "此时禁止展示市场引擎区块，禁止推断或捏造任何市场引擎字段值。\n"
+                "• state_json.market_tradeable → True/False（None=市场引擎未运行）\n"
+                "• state_json.market_confidence → high / medium / low\n"
+                "• state_json.pre_shock_regime → 冲击前趋势结构（trending/ranging 等）\n"
+                "• state_json.ssc_status → ok/missing/invalid/skipped\n"
+                "• state_json.sic_status → ok/missing/invalid/skipped\n"
+                "• state_json.structure_break → True/False（None=未运行，不等于 False）\n"
+                "• state_json.primary_narrative → 主趋势叙事文字\n"
+                "• state_json.market_risk_level → hard/soft/neutral\n\n"
+                "━━ 层 ③ 执行引擎 ━━\n"
+                "• trade=null 时看 rejection_reason（常见值：option_chain_missing / no_support_candidates_from_gateway / B_REJECT: buffer_too_thin 等）\n"
+                "• trade 有值时展示：strategy / strike / expiry / premium / contracts / delta / dte\n"
+            ),
             "parameters": {"type": "object", "properties": {
                 "symbol": {"type": "string", "description": "标的代码，如 SPY、AAPL"},
                 "date": {"type": "string", "description": "分析日期 YYYY-MM-DD"},
