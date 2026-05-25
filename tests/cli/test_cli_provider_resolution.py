@@ -115,6 +115,8 @@ def _import_cli():
 
     if "firecrawl" not in sys.modules:
         sys.modules["firecrawl"] = types.SimpleNamespace(Firecrawl=object)
+    if "fire" not in sys.modules:
+        sys.modules["fire"] = types.SimpleNamespace(Fire=lambda *args, **kwargs: None)
 
     try:
         importlib.import_module("prompt_toolkit")
@@ -212,6 +214,60 @@ def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
 
     assert result["model"] == "gpt-5"
     assert result["runtime"]["provider"] == "openrouter"
+
+
+def test_cli_turn_routing_uses_cheap_model_for_simple_prompt(monkeypatch):
+    cli = _import_cli()
+    shell = cli.HermesCLI(model="deepseek/deepseek-v4-pro", compact=True, max_turns=1)
+    shell.provider = "custom"
+    shell.api_mode = "chat_completions"
+    shell.base_url = "http://gateway.example/v1"
+    shell.api_key = "sk-primary"
+    shell._smart_model_routing = {
+        "enabled": True,
+        "max_simple_chars": 160,
+        "max_simple_words": 28,
+        "cheap_model": {
+            "provider": "custom",
+            "model": "deepseek/deepseek-v4-flash",
+            "base_url": "http://gateway.example/v1",
+        },
+    }
+
+    result = shell._resolve_turn_agent_config("Reply with exactly: OK")
+
+    assert result["model"] == "deepseek/deepseek-v4-flash"
+    assert result["runtime"]["provider"] == "custom"
+    assert result["runtime"]["base_url"] == "http://gateway.example/v1"
+
+
+def test_cli_turn_routing_uses_complex_model_for_complex_prompt(monkeypatch):
+    cli = _import_cli()
+    shell = cli.HermesCLI(model="deepseek/deepseek-v4-flash", compact=True, max_turns=1)
+    shell.provider = "custom"
+    shell.api_mode = "chat_completions"
+    shell.base_url = "http://gateway.example/v1"
+    shell.api_key = "sk-primary"
+    shell._smart_model_routing = {
+        "enabled": True,
+        "max_simple_chars": 160,
+        "max_simple_words": 28,
+        "complex_model": {
+            "provider": "custom",
+            "model": "deepseek/deepseek-v4-pro",
+            "base_url": "http://gateway.example/v1",
+        },
+    }
+
+    result = shell._resolve_turn_agent_config(
+        "In exactly two concise sentences, compare smart routing and fallback routing, "
+        "and explain why complex tasks should prefer a stronger model when cost permits in "
+        "production automation systems that need consistent quality under varied workloads."
+    )
+
+    assert result["model"] == "deepseek/deepseek-v4-pro"
+    assert result["runtime"]["provider"] == "custom"
+    assert result["runtime"]["base_url"] == "http://gateway.example/v1"
 
 
 def test_cli_prefers_config_provider_over_stale_env_override(monkeypatch):

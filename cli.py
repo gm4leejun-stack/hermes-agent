@@ -86,6 +86,7 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.smart_model_routing import normalize_smart_model_routing, resolve_turn_route
 from utils import base_url_host_matches, is_truthy_value
 
 _hermes_home = get_hermes_home()
@@ -357,6 +358,23 @@ def load_cli_config() -> Dict[str, Any]:
             },
             "web_extract": {
                 "provider": "auto",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+            },
+        },
+        "smart_model_routing": {
+            "enabled": False,
+            "max_simple_chars": 160,
+            "max_simple_words": 28,
+            "cheap_model": {
+                "provider": "",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+            },
+            "complex_model": {
+                "provider": "",
                 "model": "",
                 "base_url": "",
                 "api_key": "",
@@ -2337,6 +2355,9 @@ class HermesCLI:
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
+        self._smart_model_routing = normalize_smart_model_routing(
+            CLI_CONFIG.get("smart_model_routing")
+        )
         
         # OpenRouter provider routing preferences
         pr = CLI_CONFIG.get("provider_routing", {}) or {}
@@ -3761,18 +3782,20 @@ class HermesCLI:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
-        route = {
-            "model": self.model,
-            "runtime": runtime,
-            "signature": (
-                self.model,
-                runtime["provider"],
-                runtime["base_url"],
-                runtime["api_mode"],
-                runtime["command"],
-                tuple(runtime["args"]),
-            ),
-        }
+        route = resolve_turn_route(
+            user_message=user_message,
+            primary_model=self.model,
+            primary_runtime=runtime,
+            routing_cfg=getattr(self, "_smart_model_routing", None),
+        )
+        route["signature"] = (
+            route["model"],
+            route["runtime"]["provider"],
+            route["runtime"]["base_url"],
+            route["runtime"]["api_mode"],
+            route["runtime"]["command"],
+            tuple(route["runtime"]["args"]),
+        )
 
         service_tier = getattr(self, "service_tier", None)
         if not service_tier:

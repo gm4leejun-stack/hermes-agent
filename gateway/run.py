@@ -26,6 +26,7 @@ import signal
 import tempfile
 import threading
 import time
+import traceback
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -41,6 +42,7 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from hermes_cli.config import cfg_get
+from hermes_cli.smart_model_routing import normalize_smart_model_routing, resolve_turn_route
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -125,7 +127,103 @@ def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
             return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
         except ValueError:
             return None
-    return None
+
+
+def _start_gateway_phase_trace() -> Dict[str, Any]:
+    """Create a per-message timing trace for gateway-side phase breakdowns."""
+    now = time.perf_counter()
+    return {"start": now, "last": now, "phases": []}
+
+
+def _mark_gateway_phase(trace: Dict[str, Any], phase: str) -> float:
+    """Record elapsed milliseconds since the previous gateway phase mark."""
+    now = time.perf_counter()
+    elapsed_ms = (now - float(trace.get("last", now))) * 1000.0
+    trace["last"] = now
+    phases = trace.setdefault("phases", [])
+    phases.append((phase, elapsed_ms))
+    return elapsed_ms
+
+
+def _format_gateway_phase_trace(trace: Dict[str, Any]) -> str:
+    """Return a compact ``phase=ms`` summary string for gateway logs."""
+    parts: list[str] = []
+    for phase, elapsed_ms in trace.get("phases", []):
+        parts.append(f"{phase}={elapsed_ms:.1f}ms")
+    return ", ".join(parts)
+
+
+def _format_gateway_phase_event(
+    label: str,
+    trace: Dict[str, Any],
+    **fields: Any,
+) -> str:
+    """Return a structured gateway timing event string for logs."""
+    parts: list[str] = [f"{label}:"]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={value}")
+    breakdown = _format_gateway_phase_trace(trace)
+    if breakdown:
+        parts.append(breakdown)
+    return " ".join(parts)
+
+
+def _format_aiohttp_creation_trace(frames: Any) -> str:
+    """Render a compact tail of an aiohttp ClientSession creation stack."""
+    if not frames:
+        return ""
+    lines: list[str] = []
+    for frame in list(frames)[-2:]:
+        filename = getattr(frame, "filename", None) or frame[0]
+        lineno = getattr(frame, "lineno", None) or frame[1]
+        func = getattr(frame, "name", None) or frame[2]
+        code = getattr(frame, "line", None) or frame[3]
+        lines.append(f"{filename}:{lineno} in {func}")
+        if code:
+            lines.append(f"  {code.strip()}")
+    return "\n".join(lines)
+
+
+def _install_aiohttp_leak_trace() -> None:
+    """Attach creation-stack tracing to aiohttp ClientSession leak logs."""
+    try:
+        import aiohttp
+    except Exception:
+        return
+
+    cls = aiohttp.ClientSession
+    if getattr(cls, "_hermes_leak_trace_installed", False):
+        return
+
+    orig_init = cls.__init__
+    orig_del = getattr(cls, "__del__", None)
+
+    def _wrapped_init(self, *args, **kwargs):
+        try:
+            self._hermes_creation_trace = traceback.extract_stack(limit=12)[:-1]
+        except Exception:
+            self._hermes_creation_trace = None
+        return orig_init(self, *args, **kwargs)
+
+    def _wrapped_del(self):
+        try:
+            if not getattr(self, "closed", True):
+                rendered = _format_aiohttp_creation_trace(
+                    getattr(self, "_hermes_creation_trace", None)
+                )
+                if rendered:
+                    logger.error("aiohttp ClientSession leak origin:\n%s", rendered)
+        except Exception:
+            pass
+        if callable(orig_del):
+            return orig_del(self)
+        return None
+
+    cls.__init__ = _wrapped_init
+    cls.__del__ = _wrapped_del
+    cls._hermes_leak_trace_installed = True
 
 
 def _auto_continue_freshness_window() -> float:
@@ -160,6 +258,25 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _agent_poll_interval() -> float:
+    """Return the gateway poll interval for agent completion checks.
+
+    This controls how quickly the gateway notices that the background
+    agent thread has finished. Keep it sub-second to avoid adding a
+    fixed tail latency to short/simple requests.
+    """
+    interval = _float_env("HERMES_AGENT_POLL_INTERVAL", 0.25)
+    return interval if interval > 0 else 0.25
+
+
+def _should_wait_for_stream_consumer(stream_consumer_holder: Any) -> bool:
+    """Return whether a real stream consumer exists and needs final draining."""
+    try:
+        return bool(stream_consumer_holder and stream_consumer_holder[0] is not None)
+    except Exception:
+        return False
 
 
 def _is_fresh_gateway_interruption(
@@ -1070,6 +1187,7 @@ class GatewayRunner:
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
+        _install_aiohttp_leak_trace()
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
         self._warn_if_docker_media_delivery_is_risky()
@@ -1084,6 +1202,7 @@ class GatewayRunner:
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
+        self._smart_model_routing = self._load_smart_model_routing()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
@@ -1721,18 +1840,20 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
-        route = {
-            "model": model,
-            "runtime": runtime,
-            "signature": (
-                model,
-                runtime["provider"],
-                runtime["base_url"],
-                runtime["api_mode"],
-                runtime["command"],
-                tuple(runtime["args"]),
-            ),
-        }
+        route = resolve_turn_route(
+            user_message=user_message,
+            primary_model=model,
+            primary_runtime=runtime,
+            routing_cfg=getattr(self, "_smart_model_routing", None),
+        )
+        route["signature"] = (
+            route["model"],
+            route["runtime"]["provider"],
+            route["runtime"]["base_url"],
+            route["runtime"]["api_mode"],
+            route["runtime"]["command"],
+            tuple(route["runtime"]["args"]),
+        )
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -2268,6 +2389,20 @@ class GatewayRunner:
         except Exception:
             pass
         return {}
+
+    @staticmethod
+    def _load_smart_model_routing() -> dict:
+        """Load per-turn smart model routing config from config.yaml."""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                return normalize_smart_model_routing(cfg.get("smart_model_routing"))
+        except Exception:
+            pass
+        return normalize_smart_model_routing(None)
 
     @staticmethod
     def _load_fallback_model() -> list | dict | None:
@@ -6731,6 +6866,7 @@ class GatewayRunner:
         )
 
         try:
+            _phase_trace = _start_gateway_phase_trace()
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -6752,6 +6888,7 @@ class GatewayRunner:
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
             )
+            _mark_gateway_phase(_phase_trace, "agent_run")
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -6760,6 +6897,7 @@ class GatewayRunner:
                     await _typing_adapter.stop_typing(source.chat_id)
             except Exception:
                 pass
+            _mark_gateway_phase(_phase_trace, "stop_typing")
 
             if not self._is_session_run_current(_quick_key, run_generation):
                 logger.info(
@@ -6778,6 +6916,7 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            _mark_gateway_phase(_phase_trace, "extract_response")
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -6790,10 +6929,19 @@ class GatewayRunner:
                     "results. This can happen with some models — try again or "
                     "rephrase your question."
                 )
+            _mark_gateway_phase(_phase_trace, "normalize_response")
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
+            _phase_breakdown = _format_gateway_phase_event(
+                "response timing breakdown",
+                _phase_trace,
+                platform=_platform_name,
+                chat=source.chat_id or "unknown",
+            )
+            if _phase_breakdown:
+                logger.info("%s", _phase_breakdown)
             logger.info(
                 "response ready: platform=%s chat=%s time=%.1fs api_calls=%d response=%d chars",
                 _platform_name, source.chat_id or "unknown",
@@ -14185,6 +14333,7 @@ class GatewayRunner:
                 if _srn:
                     message = _srn + "\n\n" + message
 
+            _agent_internal_trace = _start_gateway_phase_trace()
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
@@ -14221,6 +14370,7 @@ class GatewayRunner:
                     _run_message = message
 
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                _mark_gateway_phase(_agent_internal_trace, "run_conversation")
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
@@ -14229,6 +14379,7 @@ class GatewayRunner:
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
+            _mark_gateway_phase(_agent_internal_trace, "finish_stream_consumer")
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
@@ -14245,9 +14396,21 @@ class GatewayRunner:
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _mark_gateway_phase(_agent_internal_trace, "collect_usage")
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                _mark_gateway_phase(_agent_internal_trace, "package_error_result")
+                logger.info(
+                    "%s",
+                    _format_gateway_phase_event(
+                        "agent internal timing breakdown",
+                        _agent_internal_trace,
+                        session=session_id or "unknown",
+                        model=_resolved_model or "unknown",
+                        platform=getattr(source.platform, "value", source.platform) or "unknown",
+                    ),
+                )
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -14302,6 +14465,7 @@ class GatewayRunner:
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
+            _mark_gateway_phase(_agent_internal_trace, "media_scan")
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
@@ -14319,6 +14483,7 @@ class GatewayRunner:
                 if entry:
                     entry.session_id = agent.session_id
                     self.session_store._save()
+            _mark_gateway_phase(_agent_internal_trace, "session_split_sync")
 
             effective_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
 
@@ -14367,6 +14532,19 @@ class GatewayRunner:
                     )
                 except Exception:
                     pass
+            _mark_gateway_phase(_agent_internal_trace, "maybe_auto_title")
+
+            _mark_gateway_phase(_agent_internal_trace, "package_result")
+            logger.info(
+                "%s",
+                _format_gateway_phase_event(
+                    "agent internal timing breakdown",
+                    _agent_internal_trace,
+                    session=effective_session_id or session_id or "unknown",
+                    model=_resolved_model or "unknown",
+                    platform=getattr(source.platform, "value", source.platform) or "unknown",
+                ),
+            )
 
             return {
                 "final_response": final_response,
@@ -14552,7 +14730,7 @@ class GatewayRunner:
             )
 
             _inactivity_timeout = False
-            _POLL_INTERVAL = 5.0
+            _POLL_INTERVAL = _agent_poll_interval()
 
             if _agent_timeout is None:
                 # Unlimited — still poll periodically for backup interrupt
@@ -14947,7 +15125,7 @@ class GatewayRunner:
             _notify_task.cancel()
 
             # Wait for stream consumer to finish its final edit
-            if stream_task:
+            if stream_task and _should_wait_for_stream_consumer(stream_consumer_holder):
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -14956,6 +15134,12 @@ class GatewayRunner:
                         await stream_task
                     except asyncio.CancelledError:
                         pass
+            elif stream_task:
+                stream_task.cancel()
+                try:
+                    await stream_task
+                except asyncio.CancelledError:
+                    pass
             
             # Clean up tracking
             tracking_task.cancel()

@@ -121,6 +121,76 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     assert route["request_overrides"] == {}
 
 
+def test_turn_route_uses_cheap_model_for_simple_prompt():
+    runner = _make_runner()
+    runner._smart_model_routing = {
+        "enabled": True,
+        "max_simple_chars": 160,
+        "max_simple_words": 28,
+        "cheap_model": {
+            "provider": "custom",
+            "model": "deepseek/deepseek-v4-flash",
+            "base_url": "http://gateway.example/v1",
+        },
+    }
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "http://gateway.example/v1",
+        "provider": "custom",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner,
+        "Reply with exactly: OK",
+        "deepseek/deepseek-v4-pro",
+        runtime_kwargs,
+    )
+
+    assert route["model"] == "deepseek/deepseek-v4-flash"
+    assert route["runtime"]["provider"] == "custom"
+    assert route["runtime"]["base_url"] == "http://gateway.example/v1"
+
+
+def test_turn_route_uses_complex_model_for_complex_prompt():
+    runner = _make_runner()
+    runner._smart_model_routing = {
+        "enabled": True,
+        "max_simple_chars": 160,
+        "max_simple_words": 28,
+        "complex_model": {
+            "provider": "custom",
+            "model": "deepseek/deepseek-v4-pro",
+            "base_url": "http://gateway.example/v1",
+        },
+    }
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "http://gateway.example/v1",
+        "provider": "custom",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner,
+        "In exactly two concise sentences, compare smart routing and fallback routing, "
+        "and explain why complex tasks should prefer a stronger model when cost permits in "
+        "production automation systems that need consistent quality under varied workloads.",
+        "deepseek/deepseek-v4-flash",
+        runtime_kwargs,
+    )
+
+    assert route["model"] == "deepseek/deepseek-v4-pro"
+    assert route["runtime"]["provider"] == "custom"
+    assert route["runtime"]["base_url"] == "http://gateway.example/v1"
+
+
 @pytest.mark.asyncio
 async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()

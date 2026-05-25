@@ -1518,6 +1518,52 @@ class TestSharedEventLoopLifecycle:
 
         provider_b.shutdown()
 
+
+def test_provider_del_calls_shutdown(monkeypatch):
+    provider = HindsightMemoryProvider()
+    calls = []
+
+    def _shutdown():
+        calls.append("shutdown")
+
+    monkeypatch.setattr(provider, "shutdown", _shutdown)
+
+    provider.__del__()
+
+    assert calls == ["shutdown"]
+
+
+def test_cloud_mode_operation_closes_ephemeral_client(tmp_path, monkeypatch):
+    config = {
+        "mode": "cloud",
+        "apiKey": "test-key",
+        "api_url": "http://localhost:9999",
+        "bank_id": "test-bank",
+        "budget": "mid",
+        "memory_mode": "hybrid",
+    }
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+    )
+
+    provider = HindsightMemoryProvider()
+    provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+
+    client = _make_mock_client()
+    monkeypatch.setattr(provider, "_get_client", lambda: client)
+
+    result = provider._run_hindsight_operation(
+        lambda c: c.areflect(bank_id="test-bank", query="hello", budget="mid")
+    )
+
+    assert result.text == "Synthesized answer"
+    client.areflect.assert_awaited_once()
+    client.aclose.assert_awaited_once()
+    assert provider._client is None
+
     def test_client_aclose_called_on_cloud_mode_shutdown(self, provider):
         """Per-provider session cleanup still runs even though the shared
         loop is preserved. Each provider's own aiohttp session is closed
@@ -1548,4 +1594,3 @@ class TestShutdown:
         embedded.close.assert_called_once()
         assert embedded._client is None
         assert provider._client is None
-

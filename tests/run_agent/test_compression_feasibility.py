@@ -182,6 +182,7 @@ def test_feasibility_check_passes_config_context_length(mock_get_client, mock_ct
         api_key="sk-custom",
         config_context_length=1_000_000,
         provider="openrouter",
+        custom_providers=None,
     )
 
 
@@ -205,6 +206,41 @@ def test_feasibility_check_ignores_invalid_context_length(mock_get_client, mock_
         api_key="sk-test",
         config_context_length=None,
         provider="openrouter",
+        custom_providers=None,
+    )
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=1_000_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_feasibility_check_passes_custom_provider_catalog(mock_get_client, mock_ctx_len):
+    """Compression feasibility should forward custom_providers metadata so
+    custom endpoint model context_length entries are usable without an
+    explicit auxiliary.compression.context_length override."""
+    agent = _make_agent(main_context=1_000_000, threshold_percent=0.50)
+    agent._custom_providers_context_catalog = [
+        {
+            "name": "lovbr",
+            "base_url": "http://42.240.140.106:4000/v1",
+            "models": {
+                "deepseek/deepseek-v4-flash": {"context_length": 1_000_000},
+            },
+        }
+    ]
+    mock_client = MagicMock()
+    mock_client.base_url = "http://42.240.140.106:4000/v1/"
+    mock_client.api_key = ""
+    mock_get_client.return_value = (mock_client, "deepseek/deepseek-v4-flash")
+
+    agent._emit_status = lambda msg: None
+    agent._check_compression_model_feasibility()
+
+    mock_ctx_len.assert_called_once_with(
+        "deepseek/deepseek-v4-flash",
+        base_url="http://42.240.140.106:4000/v1/",
+        api_key="",
+        config_context_length=None,
+        provider="openrouter",
+        custom_providers=agent._custom_providers_context_catalog,
     )
 
 
@@ -258,6 +294,7 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
         api_key="sk-custom",
         config_context_length=1_000_000,
         provider="",
+        custom_providers=[],
     )
 
 

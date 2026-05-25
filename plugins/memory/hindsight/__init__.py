@@ -585,6 +585,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
 
+    def __del__(self) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
     @property
     def name(self) -> str:
         return "hindsight"
@@ -866,7 +872,13 @@ class HindsightMemoryProvider(MemoryProvider):
         ]
 
     def _get_client(self):
-        """Return the cached Hindsight client (created once, reused)."""
+        """Return a Hindsight client.
+
+        Embedded mode keeps a cached long-lived client because it manages a
+        local daemon. Cloud mode prefers short-lived clients so each async SDK
+        REST session is explicitly closed after use, avoiding leaked
+        aiohttp ClientSession objects in long-running gateway processes.
+        """
         if self._client is None:
             if self._mode == "local_embedded":
                 available, reason = _check_local_runtime()
@@ -907,7 +919,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     kwargs["api_key"] = self._api_key
                 logger.debug("Creating Hindsight cloud client (url=%s, has_key=%s, timeout=%s)",
                              self._api_url, bool(self._api_key), kwargs["timeout"])
-                self._client = Hindsight(**kwargs)
+                return Hindsight(**kwargs)
         return self._client
 
     def _run_sync(self, coro):
@@ -998,6 +1010,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _run_hindsight_operation(self, operation):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
+        ephemeral_cloud_client = self._mode != "local_embedded" and self._client is None
         client = self._get_client()
         try:
             return self._run_sync(operation(client))
@@ -1012,6 +1025,14 @@ class HindsightMemoryProvider(MemoryProvider):
             client = self._get_client()
             self._client = client
             return self._run_sync(operation(client))
+        finally:
+            if ephemeral_cloud_client and client is not None:
+                try:
+                    close = getattr(client, "aclose", None)
+                    if callable(close):
+                        self._run_sync(close())
+                except Exception:
+                    logger.debug("Hindsight cloud client close failed", exc_info=True)
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.

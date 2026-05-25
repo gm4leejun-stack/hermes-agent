@@ -716,6 +716,27 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Per-turn model routing. Simple tasks can use a cheaper/faster model,
+    # and complex tasks can optionally upgrade to a stronger model before
+    # the request enters the fallback provider chain.
+    "smart_model_routing": {
+        "enabled": False,
+        "max_simple_chars": 160,
+        "max_simple_words": 28,
+        "cheap_model": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+        },
+        "complex_model": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+        },
+    },
+
     # Auxiliary model config — provider:model for each side task.
     # Format: provider is the provider name, model is the model slug.
     # "auto" for provider = auto-detect best available provider.

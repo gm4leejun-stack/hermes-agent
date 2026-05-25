@@ -40,7 +40,7 @@ import threading
 from types import SimpleNamespace
 import urllib.request
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from urllib.parse import urlparse, parse_qs, urlunparse
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -1728,6 +1728,7 @@ class AIAgent:
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+        self._custom_providers_context_catalog = None
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -1961,6 +1962,7 @@ class AIAgent:
             _custom_providers = _agent_cfg.get("custom_providers")
             if not isinstance(_custom_providers, list):
                 _custom_providers = []
+        self._custom_providers_context_catalog = _custom_providers
 
         # Check custom_providers per-model context_length
         if _config_context_length is None and _custom_providers:
@@ -2736,6 +2738,7 @@ class AIAgent:
                 # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
                 # are invoked for the correct client, not inherited from the main model.
                 provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(self, "provider", "")),
+                custom_providers=getattr(self, "_custom_providers_context_catalog", None),
             )
 
             # Hard floor: the auxiliary compression model must have at least
@@ -4951,16 +4954,46 @@ class AIAgent:
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:
-            self._memory_manager.sync_all(
-                original_user_message, final_response,
-                session_id=self.session_id or "",
+            self._timed_turn_phase(
+                "memory.sync_all",
+                lambda: self._memory_manager.sync_all(
+                    original_user_message, final_response,
+                    session_id=self.session_id or "",
+                ),
             )
-            self._memory_manager.queue_prefetch_all(
-                original_user_message,
-                session_id=self.session_id or "",
+            self._timed_turn_phase(
+                "memory.queue_prefetch_all",
+                lambda: self._memory_manager.queue_prefetch_all(
+                    original_user_message,
+                    session_id=self.session_id or "",
+                ),
             )
         except Exception:
             pass
+
+    def _timed_turn_phase(self, phase: str, fn: Callable[[], Any]) -> Any:
+        """Run a turn-finalization phase and emit elapsed time to ``agent.log``."""
+        start = time.perf_counter()
+        try:
+            result = fn()
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            logger.warning(
+                "turn phase failed: session=%s phase=%s elapsed_ms=%.1f error=%s",
+                self.session_id or "none",
+                phase,
+                elapsed_ms,
+                exc,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.info(
+            "turn phase: session=%s phase=%s elapsed_ms=%.1f",
+            self.session_id or "none",
+            phase,
+            elapsed_ms,
+        )
+        return result
 
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
@@ -14236,7 +14269,10 @@ class AIAgent:
         # can replay assistant("(empty)") / recovery nudges and fall into the
         # same empty-response loop again.
         self._drop_trailing_empty_response_scaffolding(messages)
-        self._persist_session(messages, conversation_history)
+        self._timed_turn_phase(
+            "persist_session",
+            lambda: self._persist_session(messages, conversation_history),
+        )
 
         # ── Turn-exit diagnostic log ─────────────────────────────────────
         # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -14289,12 +14325,15 @@ class AIAgent:
         if final_response and not interrupted:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _transform_results = _invoke_hook(
-                    "transform_llm_output",
-                    response_text=final_response,
-                    session_id=self.session_id or "",
-                    model=self.model,
-                    platform=getattr(self, "platform", None) or "",
+                _transform_results = self._timed_turn_phase(
+                    "hook.transform_llm_output",
+                    lambda: _invoke_hook(
+                        "transform_llm_output",
+                        response_text=final_response,
+                        session_id=self.session_id or "",
+                        model=self.model,
+                        platform=getattr(self, "platform", None) or "",
+                    ),
                 )
                 for _hook_result in _transform_results:
                     if isinstance(_hook_result, str) and _hook_result:
@@ -14310,14 +14349,17 @@ class AIAgent:
         if final_response and not interrupted:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _invoke_hook(
-                    "post_llm_call",
-                    session_id=self.session_id,
-                    user_message=original_user_message,
-                    assistant_response=final_response,
-                    conversation_history=list(messages),
-                    model=self.model,
-                    platform=getattr(self, "platform", None) or "",
+                self._timed_turn_phase(
+                    "hook.post_llm_call",
+                    lambda: _invoke_hook(
+                        "post_llm_call",
+                        session_id=self.session_id,
+                        user_message=original_user_message,
+                        assistant_response=final_response,
+                        conversation_history=list(messages),
+                        model=self.model,
+                        platform=getattr(self, "platform", None) or "",
+                    ),
                 )
             except Exception as exc:
                 logger.warning("post_llm_call hook failed: %s", exc)
@@ -14425,13 +14467,16 @@ class AIAgent:
         # Plugins can use this for cleanup, flushing buffers, etc.
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _invoke_hook(
-                "on_session_end",
-                session_id=self.session_id,
-                completed=completed,
-                interrupted=interrupted,
-                model=self.model,
-                platform=getattr(self, "platform", None) or "",
+            self._timed_turn_phase(
+                "hook.on_session_end",
+                lambda: _invoke_hook(
+                    "on_session_end",
+                    session_id=self.session_id,
+                    completed=completed,
+                    interrupted=interrupted,
+                    model=self.model,
+                    platform=getattr(self, "platform", None) or "",
+                ),
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
