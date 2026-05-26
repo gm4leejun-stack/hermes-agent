@@ -70,3 +70,6 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
+
+# Custom tools (user-created)
+# tools/reminder_tools.py  # tracked in fork
