@@ -26,5 +26,6 @@ echo "安装 my-skills 到 $SKILLS_DIR ..."
 install_skill "$SCRIPT_DIR/productivity/smart-reminder"   "$SKILLS_DIR/productivity/smart-reminder"
 install_skill "$SCRIPT_DIR/productivity/cronjob-reminder" "$SKILLS_DIR/productivity/cronjob-reminder"
 install_skill "$SCRIPT_DIR/apple/apple-reminders"         "$SKILLS_DIR/apple/apple-reminders"
+install_skill "$SCRIPT_DIR/devops/ops-daily-report"       "$SKILLS_DIR/devops/ops-daily-report"
 
 echo "完成。"
