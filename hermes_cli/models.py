@@ -1141,6 +1141,38 @@ def resolve_fast_mode_overrides(
     return {"speed": "fast"} if _is_anthropic_fast_model(model_id) else {"service_tier": "priority"}
 
 
+def resolve_model_request_overrides(
+    model_id: Optional[str],
+    *,
+    provider: Optional[str] = None,
+    base_url: str = "",
+) -> dict[str, Any] | None:
+    """Return model-specific request overrides needed by some custom endpoints.
+
+    This is intentionally narrow: only models with known hard requirements
+    get defaults here so we do not perturb unrelated providers.
+    """
+    raw_model = _strip_vendor_prefix(str(model_id or ""))
+    base_model = raw_model.split(":")[0].strip().lower()
+    normalized_provider = (provider or "").strip().lower()
+    normalized_base_url = (base_url or "").strip().lower()
+
+    if normalized_provider != "custom":
+        return None
+
+    overrides: dict[str, Any] = {}
+
+    # This endpoint rejects non-streaming chat-completions requests for GPT-5.4 mini.
+    if base_model == "gpt-5.4-mini" and normalized_base_url:
+        overrides["stream"] = True
+
+    # Kimi K2.5 rejects temperature values other than 1.
+    if base_model == "kimi-k2.5":
+        overrides["temperature"] = 1
+
+    return overrides or None
+
+
 def _first_exchangeable_copilot_token(raw_tokens) -> str:
     """Exchange stored GitHub tokens in order; the first that validates AND exchanges wins (every
     entry is tried so a later valid token survives an earlier malformed one)."""

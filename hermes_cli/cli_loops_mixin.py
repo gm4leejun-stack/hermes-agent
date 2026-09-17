@@ -234,6 +234,132 @@ class CLILoopsMixin:
         with self._busy_command(self._slow_command_status(cmd_original)):
             self._reload_skills()
 
+    def _cmd_reload_tools(self, cmd_original: str):
+        """Hot-reload local tool files without restarting the session."""
+        with self._busy_command(self._slow_command_status(cmd_original)):
+            self._reload_tools(cmd_original)
+
+    def _reload_tools(self, cmd_original: str):
+        """Re-imports all tools/*.py modules, refreshes the agent's tool list, and notifies the model.
+
+        Usage: /reload-tools [toolset_name]
+               /reload-tools          # reload all builtin tools
+               /reload-tools mytools  # reload only tools in 'mytools' toolset
+        """
+        try:
+            from tools.registry import discover_builtin_tools, registry
+            from model_tools import get_tool_definitions
+            import importlib
+            import sys
+
+            # Parse optional toolset filter
+            parts = cmd_original.split(None, 1)
+            toolset_filter = parts[1].strip() if len(parts) > 1 else None
+
+            if not self._command_running:
+                if toolset_filter:
+                    print(f"🔄 Hot-reloading tools in toolset '{toolset_filter}'...")
+                else:
+                    print("🔄 Hot-reloading all local tools...")
+
+            # Capture current tool list for diff
+            old_tools = set(registry._tools.keys())
+            old_by_toolset: dict = {}
+            for name, entry in registry._tools.items():
+                entry_toolset = getattr(entry, "toolset", "")
+                if entry_toolset not in old_by_toolset:
+                    old_by_toolset[entry_toolset] = set()
+                old_by_toolset[entry_toolset].add(name)
+
+            # Re-discover and re-import builtin tools
+            imported = discover_builtin_tools()
+            for mod_name in imported:
+                try:
+                    if mod_name in sys.modules:
+                        importlib.reload(sys.modules[mod_name])
+                except Exception as e:
+                    print(f"  ⚠️  Failed to reload {mod_name}: {e}")
+
+            # Capture new tool list
+            new_tools = set(registry._tools.keys())
+            new_by_toolset: dict = {}
+            for name, entry in registry._tools.items():
+                entry_toolset = getattr(entry, "toolset", "")
+                if entry_toolset not in new_by_toolset:
+                    new_by_toolset[entry_toolset] = set()
+                new_by_toolset[entry_toolset].add(name)
+
+            # Compute changes (optionally filtered by toolset)
+            filter_set = None
+            if toolset_filter:
+                filter_set = new_by_toolset.get(toolset_filter, set())
+                if not filter_set:
+                    print(f"  ⚠️  Toolset '{toolset_filter}' not found or empty.")
+
+            if filter_set:
+                added = (new_tools - old_tools) & filter_set
+                removed = (old_tools - new_tools) & filter_set
+                changed = filter_set & (old_tools & new_tools)
+            else:
+                added = new_tools - old_tools
+                removed = old_tools - new_tools
+                changed = set()
+
+            if added:
+                print(f"  ➕ Added: {', '.join(sorted(added))}")
+            if removed:
+                print(f"  ➖ Removed: {', '.join(sorted(removed))}")
+            if changed:
+                print(f"  ♻️  Reloaded: {len(changed)} tool(s) in '{toolset_filter}'")
+            if not (added or removed or changed):
+                if toolset_filter:
+                    print(f"  ✓ Toolset '{toolset_filter}' up to date")
+                else:
+                    print(f"  ✓ All tools up to date ({len(new_tools)} registered)")
+
+            print(f"  📦 {len(new_tools)} total tool(s) registered")
+
+            # Refresh agent's tool list
+            if self.agent is not None:
+                self.agent.tools = get_tool_definitions(
+                    enabled_toolsets=self.agent.enabled_toolsets
+                    if hasattr(self.agent, "enabled_toolsets") else None,
+                    quiet_mode=True,
+                )
+                self.agent.valid_tool_names = {
+                    tool["function"]["name"] for tool in self.agent.tools
+                } if self.agent.tools else set()
+
+                # Inject notification into conversation history
+                change_parts = []
+                if toolset_filter:
+                    change_parts.append(f"toolset '{toolset_filter}' reloaded")
+                else:
+                    if added:
+                        change_parts.append(f"added: {', '.join(sorted(added))}")
+                    if removed:
+                        change_parts.append(f"removed: {', '.join(sorted(removed))}")
+                change_msg = "; ".join(change_parts) if change_parts else "tools reloaded"
+
+                self.conversation_history.append({
+                    "role": "system",
+                    "content": f"[System: Local tools hot-reloaded — {change_msg}]"
+                })
+
+                # Persist updated history (best effort)
+                try:
+                    self.agent._persist_session(
+                        self.conversation_history,
+                        self.conversation_history,
+                    )
+                except Exception:
+                    pass
+
+                print(f"  ✅ Agent updated — {len(self.agent.tools)} tool(s) available")
+
+        except Exception as e:
+            print(f"  ❌ Tool reload failed: {e}")
+
     def _cmd_plugins(self, cmd_original: str):
         from hermes_constants import display_hermes_home
         try:

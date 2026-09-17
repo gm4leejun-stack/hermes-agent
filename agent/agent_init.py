@@ -2267,7 +2267,18 @@ def init_agent(
 
     # reasoning_content echo opt-in; switch_model / fallback / restore keep it in sync.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
-    agent.request_overrides = dict(request_overrides or {})
+    try:
+        from hermes_cli.models import resolve_model_request_overrides
+        model_request_overrides = resolve_model_request_overrides(
+            getattr(agent, "model", None),
+            provider=getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", "") or "",
+        ) or {}
+    except Exception:
+        model_request_overrides = {}
+    agent.request_overrides = dict(model_request_overrides)
+    if request_overrides:
+        agent.request_overrides.update(request_overrides)
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
 
