@@ -186,6 +186,7 @@ class GatewayTurnMixin:
         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
         from gateway.run import _deep_merge_request_overrides
         from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.smart_model_routing import resolve_turn_route
         # Tests bind this method onto bare namespaces, so no class-level tables here.
         runtime = {
             k: runtime_kwargs.get(k) for k in (
@@ -196,14 +197,17 @@ class GatewayTurnMixin:
         runtime["args"] = list(runtime["args"] or [])
         runtime["capabilities"] = dict(runtime["capabilities"] or {})
         base_request_overrides = dict(runtime_kwargs.get("request_overrides") or {})
-        route = {
-            "model": model,
-            "runtime": runtime,
-            "signature": (
-                model, runtime["provider"], runtime["requested_provider"], runtime["base_url"],
-                runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
-            ),
-        }
+        route = resolve_turn_route(
+            user_message=user_message,
+            primary_model=model,
+            primary_runtime=runtime,
+            routing_cfg=getattr(self, "_smart_model_routing", None),
+        )
+        route["signature"] = (
+            route["model"], route["runtime"]["provider"], route["runtime"]["requested_provider"],
+            route["runtime"]["base_url"], route["runtime"]["api_mode"], route["runtime"]["command"],
+            tuple(route["runtime"]["args"]),
+        )
         if getattr(self, "_service_tier", None) != "priority":
             # None / auto / cold: the bounded window is applied per request by agent.fast_mode.
             route["request_overrides"] = base_request_overrides
@@ -217,6 +221,16 @@ class GatewayTurnMixin:
         # Fast-mode keys (service_tier / speed) are top-level and don't collide with extra_body.
         route["request_overrides"] = _deep_merge_request_overrides(base_request_overrides, overrides or {})
         return route
+
+    def _load_smart_model_routing(self) -> dict:
+        """Load smart model routing config (normalized; fail-open)."""
+        from gateway.run import _load_gateway_config
+        from hermes_cli.smart_model_routing import normalize_smart_model_routing
+        try:
+            cfg = _load_gateway_config()
+            return normalize_smart_model_routing(cfg.get("smart_model_routing"))
+        except Exception:
+            return normalize_smart_model_routing(None)
 
     def _sync_session_model_from_agent(self, session_id: str, agent: Any) -> None:
         """Persist the runtime model/provider a gateway turn actually used (provider fallback can

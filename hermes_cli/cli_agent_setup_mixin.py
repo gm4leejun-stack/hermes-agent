@@ -396,17 +396,34 @@ class CLIAgentSetupMixin:
         provider. With `/fast` on (service_tier == "priority") attach request_overrides;
         auto/cold tiers are applied per request by agent.fast_mode instead."""
         from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.smart_model_routing import resolve_turn_route
         runtime = _current_runtime(self)
-        route = {"model": self.model, "runtime": runtime, "signature": _route_signature(self.model, runtime)}
+        route = resolve_turn_route(
+            user_message=user_message,
+            primary_model=self.model,
+            primary_runtime=runtime,
+            routing_cfg=self._load_smart_model_routing(),
+        )
+        route["signature"] = _route_signature(route["model"], route["runtime"])
         overrides = None
         if getattr(self, "service_tier", None) == "priority":
             try:
                 overrides = resolve_fast_mode_overrides(
-                    route["model"], provider=runtime["provider"], base_url=runtime["base_url"])
+                    route["model"], provider=route["runtime"]["provider"], base_url=route["runtime"]["base_url"])
             except Exception:
                 pass
         route["request_overrides"] = overrides
         return route
+
+    def _load_smart_model_routing(self) -> dict:
+        """Load smart model routing config (normalized; fail-open)."""
+        from hermes_cli.config import load_config
+        from hermes_cli.smart_model_routing import normalize_smart_model_routing
+        try:
+            cfg = load_config()
+            return normalize_smart_model_routing(cfg.get("smart_model_routing"))
+        except Exception:
+            return normalize_smart_model_routing(None)
 
     def _follow_compression_chain(self, session_meta, announce):
         """If the resumed id is an empty compression-chain head, announce and switch to
