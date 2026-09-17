@@ -1,0 +1,6 @@
+name: api-guard
+version: 1.0.0
+description: "拦截 terminal/execute_code 直接访问受保护 API，强制使用注册的 MCP 工具"
+author: "hermes-agent"
+hooks:
+  - pre_tool_call

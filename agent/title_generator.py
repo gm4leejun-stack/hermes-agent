@@ -242,7 +242,20 @@ def _safe_callback(callback: Optional[Callable], args: tuple, log_fmt: str, labe
         logger.debug(log_fmt, label, exc_info=True)
 
 
+def _is_transient_auxiliary_error(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and 500 <= status_code <= 599:
+        return True
+    exc_name = type(exc).__name__.lower()
+    return any(
+        marker in exc_name
+        for marker in ("connection", "timeout", "connecterror", "readtimeout")
+    )
+
+
 def _report_failure(failure_callback: Optional[FailureCallback], exc: BaseException, label: str) -> None:
+    if _is_transient_auxiliary_error(exc):
+        return
     _safe_callback(failure_callback, ("title generation", exc), "%s failure_callback raised", label)
 
 

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes.local/schemas/project-workflow.schema.json",
+  "title": "Hermes Project Workflow State",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "projects", "updated_at"],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "projects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/project" }
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "state": {
+      "type": "string",
+      "enum": ["planned", "active", "blocked", "completed", "canceled", "todo", "doing", "review", "done"]
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "title", "state", "created_at", "updated_at", "depends_on", "notes"],
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "state": { "$ref": "#/$defs/state" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "updated_at": { "$ref": "#/$defs/timestamp" },
+        "blocked_reason": { "type": ["string", "null"] },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "milestone": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "name", "state", "tasks"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "state": { "$ref": "#/$defs/state" },
+        "tasks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/task" }
+        }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "name", "goal", "state", "created_at", "updated_at", "owner", "definition_of_done", "milestones"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "goal": { "type": "string" },
+        "state": { "$ref": "#/$defs/state" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "updated_at": { "$ref": "#/$defs/timestamp" },
+        "owner": { "type": "string" },
+        "definition_of_done": { "type": "array", "items": { "type": "string" } },
+        "milestones": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/milestone" }
+        }
+      }
+    }
+  }
+}
