@@ -179,6 +179,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
         self.gateway_runner = None  # set externally; needed for cross-platform delivery
+        self._weixin_consumer = None  # started in connect(), stopped in disconnect() (Step 4)
         # Idempotency: TTL cache of recently processed delivery IDs.
         self._seen_deliveries: Dict[str, float] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
@@ -245,9 +246,22 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.info("[webhook] Listening on %s:%d — routes: %s", self._host or "* (all interfaces, IPv4+IPv6)",
                     self._port, ", ".join(self._routes.keys()) or "(none configured)")
         self._wire_plugin_handlers(None)
+        # 启动微信投递队列的后台消费者(幂等:重连时若已在跑就不重复建,避免孤儿任务)。
+        if getattr(self, "_weixin_consumer", None) is None:
+            from hermes_cli.config import get_hermes_home
+            from tools.weixin_outbox_consumer import WeixinOutboxConsumer
+            from tools.weixin_outbox_sender import make_webhook_sender
+            self._weixin_consumer = WeixinOutboxConsumer(
+                get_hermes_home(), make_webhook_sender(self, profile=None))
+            self._weixin_consumer.start()
+            logger.info("[webhook] weixin outbox consumer started")
         return True
 
     async def disconnect(self) -> None:
+        if getattr(self, "_weixin_consumer", None) is not None:
+            await self._weixin_consumer.stop()
+            self._weixin_consumer = None
+            logger.info("[webhook] weixin outbox consumer stopped")
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -476,6 +490,24 @@ class WebhookAdapter(BasePlatformAdapter):
                     "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload)}
         logger.info("[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s", event_type,
                     route_name, delivery["deliver"], len(prompt), delivery_id)
+        # 微信投递管道:weixin 目标改走落盘队列(202),由后台消费者按 ~35s 节奏发,
+        # 避开 iLink 硬限流(~1/30s)与洪水式 502 重试。其它目标保持原同步发不动。
+        if delivery["deliver"] == "weixin":
+            from hermes_cli.config import get_hermes_home
+            from tools import weixin_outbox
+            chat_id = (delivery.get("deliver_extra") or {}).get("chat_id") or ""
+            did = hashlib.sha256(f"{route_name}\x00{chat_id}\x00{prompt}".encode("utf-8")).hexdigest()[:40]
+            try:
+                weixin_outbox.enqueue(get_hermes_home(), route=route_name,
+                                      chat_id=chat_id, message=prompt, delivery_id=did)
+            except Exception:
+                logger.exception("[webhook] outbox enqueue failed route=%s delivery=%s", route_name, did)
+                return web.json_response({"status": "error", "error": "enqueue failed",
+                                          "delivery_id": did}, status=500)
+            logger.info("[webhook] enqueued route=%s target=weixin delivery=%s msg_len=%d",
+                        route_name, did, len(prompt))
+            return web.json_response({"status": "queued", "route": route_name,
+                                      "target": "weixin", "delivery_id": did}, status=202)
         failed = {"status": "error", "error": "Delivery failed", "delivery_id": delivery_id}
         try:
             result = await self._direct_deliver(prompt, delivery)

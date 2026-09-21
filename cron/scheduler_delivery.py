@@ -1781,6 +1781,34 @@ def _deliver_result(
                     unverified_targets.append(bot_chat_error)
             continue
 
+        # 微信纯文本投递改走落盘队列(与 webhook deliver_only 同款):enqueue → 后台消费者
+        # 按 ~35s 节奏发,避开 iLink 硬限流(~1/30s)与洪水式 502 重试。带附件的微信目标
+        # (media_files 非空)漏到下方 live/standalone 老路——outbox 无媒体通道,否则附件被静默丢弃。
+        # 消费者在 webhook 启动时绑 get_hermes_home(),这里必须用同一个 home,队列才有人消费。
+        if str(target.get("platform", "")).lower() == "weixin" and not media_files:
+            chat_id = str(target.get("chat_id") or "")
+            if chat_id:
+                import hashlib
+                from hermes_cli.config import get_hermes_home
+                from tools import weixin_outbox
+                route = f"cron:{job.get('id', '?')}"
+                did = hashlib.sha256(
+                    f"{route}\x00{chat_id}\x00{cleaned_delivery_content}".encode("utf-8")
+                ).hexdigest()[:40]
+                try:
+                    weixin_outbox.enqueue(
+                        get_hermes_home(), route=route, chat_id=chat_id,
+                        message=cleaned_delivery_content, delivery_id=did)
+                    logger.info(
+                        "Job '%s': enqueued weixin delivery route=%s delivery=%s msg_len=%d",
+                        job["id"], route, did, len(cleaned_delivery_content))
+                except Exception as e:
+                    msg = f"weixin outbox enqueue failed: {e}"
+                    logger.exception("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                continue
+            # chat_id 缺失(理论上不该发生:home 未配则 target 根本不生成)→ 落老路由其报错。
+
         t = _prepare_target_delivery(
             job, target, adapters=adapters, loop=loop, config=config,
             notify_delivery=notify_delivery,
